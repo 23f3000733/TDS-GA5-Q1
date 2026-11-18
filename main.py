@@ -95,6 +95,21 @@ def best_sentences(question: str, passage: str, k: int = 2) -> str:
     chosen = [row for row in chosen if row[0] > 0] or scored[:1]
     return " ".join(sentence for _, _, sentence in sorted(chosen, key=lambda row: row[1]))
 
+def pick_passages(question: str, ranked: list[tuple[int, float]]) -> list[int]:
+    """Greedily select high-ranking passages that cover rare query terms."""
+    if not ranked:
+        return []
+    rare = {term for term in set(tokens(question)) if 0 < DOC_FREQ.get(term, 0) <= 3}
+    top_score = ranked[0][1]
+    chosen: list[int] = []
+    covered: set[str] = set()
+    for index, score in ranked[:6]:
+        new_terms = (rare & set(DOC_TOKENS[index])) - covered
+        if not chosen or (new_terms and score >= 0.4 * top_score):
+            chosen.append(index)
+            covered |= new_terms
+    return chosen[:3]
+
 class Query(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
     top_k: int = Field(default=3, ge=1, le=10)
@@ -107,6 +122,7 @@ class Result(BaseModel):
 
 @app.post("/query", response_model=Result)
 def query(req: Query) -> Result:
+    print("Q:", req.question, "| top_k:", req.top_k, flush=True)
     question = clean_question(req.question)
     if not tokens(question):
         return Result(answer=None, sources=[], scores=[], confidence=0.05)
@@ -115,23 +131,22 @@ def query(req: Query) -> Result:
         return Result(answer=None, sources=[], scores=[], confidence=0.05)
     best = ranked[0][1]
     second = ranked[1][1] if len(ranked) > 1 else 0.0
-    compare = bool(COMPARE_RE.search(question))
-    confidence = 1.0 - math.exp(-max(0.0, best) / 3.0)
-    if not compare:
-        confidence = 0.65 * confidence + 0.35 * max(0.0, min(1.0, (best - second) / max(best, 0.35)))
+    strength = 1.0 - math.exp(-max(0.0, best) / 3.0)
+    margin = max(0.0, min(1.0, (best - second) / max(best, 0.35)))
+    confidence = 0.65 * strength + 0.35 * margin
     # Require both a minimum evidence score and calibrated confidence to avoid guessing.
     if best < 0.75 or confidence < 0.34:
         return Result(answer=None, sources=[], scores=[], confidence=min(0.39, confidence))
-    chosen = ranked[:req.top_k]
-    raw = [s for _, s in chosen]
-    top_score = max(raw[0], 1e-9)
-    normalized = [round(min(1.0, max(0.0, s / top_score)), 4) for s in raw]
-    if compare:
-        used = [i for i, score in chosen if score >= 0.5 * best][:3]
-    else:
-        used = [chosen[0][0]]
-    answer = " ".join(best_sentences(question, PASSAGES[i]) for i in used)
-    return Result(answer=answer, sources=[i for i, _ in chosen], scores=normalized,
+    used = pick_passages(question, ranked)
+    score_of = dict(ranked)
+    pool = list(dict.fromkeys(used + [i for i, _ in ranked[:req.top_k]]))
+    pool.sort(key=lambda i: (-score_of[i], i))
+    pool = pool[:max(req.top_k, len(used))]
+    top_score = max(score_of[pool[0]], 1e-9)
+    normalized = [round(min(1.0, score_of[i] / top_score), 4) for i in pool]
+    answer = " ".join(PASSAGES[i] for i in used)
+    print("A:", answer, "| src:", pool, flush=True)
+    return Result(answer=answer, sources=pool, scores=normalized,
                   confidence=round(max(0.61, min(0.99, confidence)), 4))
 
 @app.get("/health")
