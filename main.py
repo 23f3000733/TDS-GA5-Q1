@@ -22,10 +22,21 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 STOP = set("a an the and or but of in on at to for from by with as is are was were be been being do does did how what which who when where why can could should would about explain tell give list according".split())
 TOKEN_RE = re.compile(r"[a-z0-9]+(?:[-'][a-z0-9]+)*", re.I)
-INJECTION_RE = re.compile(r"ignore (all )?(previous|prior) instructions|system prompt|reveal.*(prompt|secret)|disregard.*instruction", re.I)
+INJ_SENT = re.compile(
+    r"[^.!?\n]*(ignore (all )?(previous|prior)|disregard|system prompt|reveal[^.!?\n]*(prompt|secret)"
+    r"|you are now|instead (say|respond|output|answer))[^.!?\n]*[.!?]?", re.I
+)
+COMPARE_RE = re.compile(r"\b(compare|versus|vs\.?|difference|differ|both|contrast|between)\b", re.I)
+NUM_CUE = re.compile(r"\b(how many|how long|what (is|are) the|value|threshold|timeout|interval|port|size|quorum|limit|bits?)\b", re.I)
+
+def stem(t: str) -> str:
+    return t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t
 
 def tokens(text: str) -> list[str]:
-    return [t.lower() for t in TOKEN_RE.findall(text) if t.lower() not in STOP]
+    return [stem(t) for t in (x.lower() for x in TOKEN_RE.findall(text)) if t not in STOP]
+
+def clean_question(question: str) -> str:
+    return INJ_SENT.sub(" ", question).strip()
 
 DOC_TOKENS = [tokens(p) for p in PASSAGES]
 DOC_FREQ = Counter(t for doc in DOC_TOKENS for t in set(doc))
@@ -51,6 +62,8 @@ def rank(question: str) -> list[tuple[int, float]]:
         qweights.update({a: 0.45 for a in ALIASES.get(t, [])})
     scores = []
     n = len(PASSAGES)
+    qlower = question.lower()
+    phrases = [p for p in re.findall(r"[a-z0-9]+(?:\s+[a-z0-9]+){1,2}", qlower) if len(p) > 5]
     for i, doc in enumerate(DOC_TOKENS):
         counts = Counter(doc)
         score = 0.0
@@ -62,33 +75,25 @@ def rank(question: str) -> list[tuple[int, float]]:
             norm = tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * len(doc) / AVG_LEN))
             score += weight * idf * norm
         # Phrase and named-entity overlap is valuable for distinguishing confounders.
-        qlower = question.lower()
-        for phrase in re.findall(r"[a-z0-9]+(?:\s+[a-z0-9]+){1,2}", qlower):
-            if len(phrase) > 5 and phrase in PASSAGES[i].lower():
+        for phrase in phrases:
+            if phrase in PASSAGES[i].lower():
                 score += 1.2
         scores.append((i, score))
     return sorted(scores, key=lambda x: (-x[1], x[0]))
 
-def confidence_for(best: float, second: float, question: str) -> float:
-    # BM25 score is transformed to [0,1]; score margin rejects weak/no-evidence matches.
-    strength = 1.0 - math.exp(-max(0.0, best) / 3.0)
-    margin = (best - second) / max(best, 0.35)
-    conf = 0.65 * strength + 0.35 * max(0.0, min(1.0, margin))
-    if INJECTION_RE.search(question):
-        return 0.0
-    return max(0.0, min(0.99, conf))
-
-def answer_from(question: str, passages: list[str]) -> str:
-    # Return factual sentence(s) from the evidence; never follow instructions embedded in KB text.
+def best_sentences(question: str, passage: str, k: int = 2) -> str:
     qwords = set(tokens(question))
-    sentences = [s.strip() for p in passages for s in re.split(r"(?<=[.!?])\s+", p) if s.strip()]
-    ranked = []
-    for s in sentences:
-        overlap = len(qwords & set(tokens(s)))
-        ranked.append((overlap, s))
-    ranked.sort(key=lambda x: (-x[0], len(x[1])))
-    selected = [s for n, s in ranked[:2] if n > 0]
-    return " ".join(selected) if selected else passages[0]
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", passage) if s.strip()]
+    want_num = bool(NUM_CUE.search(question))
+    scored = []
+    for idx, sentence in enumerate(sentences):
+        score = len(qwords & set(tokens(sentence)))
+        if want_num and re.search(r"\d", sentence):
+            score += 0.5
+        scored.append((score, idx, sentence))
+    chosen = sorted(scored, key=lambda row: (-row[0], row[1]))[:k]
+    chosen = [row for row in chosen if row[0] > 0] or scored[:1]
+    return " ".join(sentence for _, _, sentence in sorted(chosen, key=lambda row: row[1]))
 
 class Query(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
@@ -102,22 +107,32 @@ class Result(BaseModel):
 
 @app.post("/query", response_model=Result)
 def query(req: Query) -> Result:
-    if INJECTION_RE.search(req.question):
+    question = clean_question(req.question)
+    if not tokens(question):
         return Result(answer=None, sources=[], scores=[], confidence=0.05)
-    ranked = rank(req.question)
+    ranked = rank(question)
     if not ranked:
         return Result(answer=None, sources=[], scores=[], confidence=0.05)
-    best, second = ranked[0][1], ranked[1][1] if len(ranked) > 1 else 0.0
-    confidence = confidence_for(best, second, req.question)
+    best = ranked[0][1]
+    second = ranked[1][1] if len(ranked) > 1 else 0.0
+    compare = bool(COMPARE_RE.search(question))
+    confidence = 1.0 - math.exp(-max(0.0, best) / 3.0)
+    if not compare:
+        confidence = 0.65 * confidence + 0.35 * max(0.0, min(1.0, (best - second) / max(best, 0.35)))
     # Require both a minimum evidence score and calibrated confidence to avoid guessing.
     if best < 0.75 or confidence < 0.34:
         return Result(answer=None, sources=[], scores=[], confidence=min(0.39, confidence))
     chosen = ranked[:req.top_k]
     raw = [s for _, s in chosen]
     top_score = max(raw[0], 1e-9)
-    normalized = [round(min(1.0, max(0.0, s / top_score * (0.75 + 0.25 * (1 - math.exp(-s))))), 4) for s in raw]
-    answer = answer_from(req.question, [PASSAGES[i] for i, _ in chosen[:2]])
-    return Result(answer=answer, sources=[i for i, _ in chosen], scores=normalized, confidence=round(max(0.61, confidence), 4))
+    normalized = [round(min(1.0, max(0.0, s / top_score)), 4) for s in raw]
+    if compare:
+        used = [i for i, score in chosen if score >= 0.5 * best][:3]
+    else:
+        used = [chosen[0][0]]
+    answer = " ".join(best_sentences(question, PASSAGES[i]) for i in used)
+    return Result(answer=answer, sources=[i for i, _ in chosen], scores=normalized,
+                  confidence=round(max(0.61, min(0.99, confidence)), 4))
 
 @app.get("/health")
 def health() -> dict[str, object]:
