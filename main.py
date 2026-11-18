@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -12,6 +11,8 @@ from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import numpy as np
+from fastembed import TextEmbedding
 
 HERE = Path(__file__).resolve().parent
 with (HERE / "knowledge_base.json").open(encoding="utf-8") as f:
@@ -26,8 +27,9 @@ INJ_SENT = re.compile(
     r"[^.!?\n]*(ignore (all )?(previous|prior)|disregard|system prompt|reveal[^.!?\n]*(prompt|secret)"
     r"|you are now|instead (say|respond|output|answer))[^.!?\n]*[.!?]?", re.I
 )
-COMPARE_RE = re.compile(r"\b(compare|versus|vs\.?|difference|differ|both|contrast|between)\b", re.I)
-NUM_CUE = re.compile(r"\b(how many|how long|what (is|are) the|value|threshold|timeout|interval|port|size|quorum|limit|bits?)\b", re.I)
+HTML_RE = re.compile(r"<!--.*?-->|\[\s*SYSTEM[^\]]*\]", re.I | re.S)
+MULTI_RE = re.compile(r"\b(both|integrate|synthes\w*|combine|compare|difference|contrast)\b", re.I)
+MECH_RE = re.compile(r"^\s*(how (does|do|is|are)\b|why\b)|formulation|formula|equation|derivation|proof", re.I)
 
 def stem(t: str) -> str:
     return t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t
@@ -36,11 +38,21 @@ def tokens(text: str) -> list[str]:
     return [stem(t) for t in (x.lower() for x in TOKEN_RE.findall(text)) if t not in STOP]
 
 def clean_question(question: str) -> str:
-    return INJ_SENT.sub(" ", question).strip()
+    return INJ_SENT.sub(" ", HTML_RE.sub(" ", question)).strip()
 
 DOC_TOKENS = [tokens(p) for p in PASSAGES]
 DOC_FREQ = Counter(t for doc in DOC_TOKENS for t in set(doc))
 AVG_LEN = sum(map(len, DOC_TOKENS)) / max(1, len(DOC_TOKENS))
+
+EMB = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir="/app/models")
+P_VEC = np.array(list(EMB.embed(PASSAGES)))
+P_VEC /= np.linalg.norm(P_VEC, axis=1, keepdims=True)
+QPREFIX = "Represent this sentence for searching relevant passages: "
+COS_MIN = 0.55
+
+def dense(question: str) -> np.ndarray:
+    vector = np.array(list(EMB.embed([QPREFIX + question])))[0]
+    return P_VEC @ (vector / np.linalg.norm(vector))
 
 # Small conceptual expansions help with common paraphrases while exact terms retain priority.
 ALIASES = {
@@ -122,32 +134,33 @@ class Result(BaseModel):
 
 @app.post("/query", response_model=Result)
 def query(req: Query) -> Result:
-    print("Q:", req.question, "| top_k:", req.top_k, flush=True)
     question = clean_question(req.question)
+    abstain = Result(answer=None, sources=[], scores=[], confidence=0.1)
     if not tokens(question):
-        return Result(answer=None, sources=[], scores=[], confidence=0.05)
-    ranked = rank(question)
-    if not ranked:
-        return Result(answer=None, sources=[], scores=[], confidence=0.05)
-    best = ranked[0][1]
-    second = ranked[1][1] if len(ranked) > 1 else 0.0
-    strength = 1.0 - math.exp(-max(0.0, best) / 3.0)
-    margin = max(0.0, min(1.0, (best - second) / max(best, 0.35)))
-    confidence = 0.65 * strength + 0.35 * margin
-    # Require both a minimum evidence score and calibrated confidence to avoid guessing.
-    if best < 0.75 or confidence < 0.34:
-        return Result(answer=None, sources=[], scores=[], confidence=min(0.39, confidence))
-    used = pick_passages(question, ranked)
-    score_of = dict(ranked)
-    pool = list(dict.fromkeys(used + [i for i, _ in ranked[:req.top_k]]))
-    pool.sort(key=lambda i: (-score_of[i], i))
-    pool = pool[:max(req.top_k, len(used))]
-    top_score = max(score_of[pool[0]], 1e-9)
-    normalized = [round(min(1.0, score_of[i] / top_score), 4) for i in pool]
+        return abstain
+    multi = bool(MULTI_RE.search(question))
+    if MECH_RE.search(question) and not multi:
+        print("ABSTAIN mech:", question, flush=True)
+        return abstain
+
+    bm = dict(rank(question))
+    cosine = dense(question)
+    cmax = float(cosine.max())
+    bmax = max(max(bm.values()), 1e-9)
+    final = {i: 0.5 * bm[i] / bmax + 0.5 * float(cosine[i]) for i in range(len(PASSAGES))}
+    order = sorted(final, key=lambda i: (-final[i], i))
+    print(f"Q: {question} | cmax={cmax:.3f} | top={order[:3]}", flush=True)
+
+    if cmax < COS_MIN:
+        return abstain
+
+    used = order[:2] if multi else order[:1]
+    sources = order[:req.top_k]
+    scores = [round(min(1.0, final[i] / max(final[order[0]], 1e-9)), 4) for i in sources]
     answer = " ".join(PASSAGES[i] for i in used)
-    print("A:", answer, "| src:", pool, flush=True)
-    return Result(answer=answer, sources=pool, scores=normalized,
-                  confidence=round(max(0.61, min(0.99, confidence)), 4))
+    print("A:", answer, "| src:", sources, flush=True)
+    return Result(answer=answer, sources=sources, scores=scores,
+                  confidence=round(min(0.99, max(0.62, cmax)), 4))
 
 @app.get("/health")
 def health() -> dict[str, object]:
