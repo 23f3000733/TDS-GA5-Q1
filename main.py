@@ -174,8 +174,12 @@ def query(req: Query) -> Result:
     if cmax < COS_MIN:
         return abstain
 
-    used = order[:2] if multi else order[:1]
-    sources = order[:req.top_k]
+    if multi:
+        used = order[:2]
+        sources = used[:]
+    else:
+        used = order[:1]
+        sources = order[:req.top_k]
     scores = [round(min(1.0, final[i] / max(final[order[0]], 1e-9)), 4) for i in sources]
     answer = " ".join(PASSAGES[i] for i in used)
     print("A:", answer, "| src:", sources, flush=True)
