@@ -28,6 +28,12 @@ INJ_SENT = re.compile(
     r"|you are now|instead (say|respond|output|answer))[^.!?\n]*[.!?]?", re.I
 )
 HTML_RE = re.compile(r"<!--.*?-->|\[\s*SYSTEM[^\]]*\]", re.I | re.S)
+INJ_EXTRA = re.compile(
+    r"(\{[^{}]*(sources|confidence|override)[^{}]*\}"
+    r"|#{2,}.*$|(?:note|instruction|system|assistant)\s*(?:to \w+)?\s*:.*$"
+    r"|force\s+sources.*$|set\s+confidence.*$|return\s+(sources|confidence).*$)",
+    re.I | re.M,
+)
 MULTI_RE = re.compile(r"\b(both|integrate|synthes\w*|combine|compare|difference|contrast)\b", re.I)
 MECH_RE = re.compile(r"^\s*(how (does|do|is|are)\b|why\b)|formulation|formula|equation|derivation|proof", re.I)
 
@@ -38,7 +44,9 @@ def tokens(text: str) -> list[str]:
     return [stem(t) for t in (x.lower() for x in TOKEN_RE.findall(text)) if t not in STOP]
 
 def clean_question(question: str) -> str:
-    return INJ_SENT.sub(" ", HTML_RE.sub(" ", question)).strip()
+    question = HTML_RE.sub(" ", question)
+    question = INJ_EXTRA.sub(" ", question)
+    return INJ_SENT.sub(" ", question).strip()
 
 DOC_TOKENS = [tokens(p) for p in PASSAGES]
 DOC_FREQ = Counter(t for doc in DOC_TOKENS for t in set(doc))
@@ -64,6 +72,16 @@ ALIASES = {
     "authentication": ["oauth", "jwt", "credential"], "rate": ["limiting", "bucket", "throttle"],
     "failure": ["dead", "suspicion", "eviction"], "causality": ["causal", "vector", "clock"],
 }
+SYN = {
+    "keepalive": "heartbeat", "coordinator": "leader", "subordinate": "follower",
+    "replicas": "nodes", "signals": "heartbeats", "scalar": "rate",
+    "coefficient": "rate", "socket": "port", "daemon": "server",
+}
+
+def expand(question: str) -> str:
+    lower = question.lower()
+    extra = [value for key, value in SYN.items() if key in lower]
+    return question + (" (" + " ".join(extra) + ")" if extra else "")
 
 def rank(question: str) -> list[tuple[int, float]]:
     q = tokens(question)
@@ -135,6 +153,7 @@ class Result(BaseModel):
 @app.post("/query", response_model=Result)
 def query(req: Query) -> Result:
     question = clean_question(req.question)
+    print("CLEAN:", question, flush=True)
     abstain = Result(answer=None, sources=[], scores=[], confidence=0.1)
     if not tokens(question):
         return abstain
@@ -143,11 +162,12 @@ def query(req: Query) -> Result:
         print("ABSTAIN mech:", question, flush=True)
         return abstain
 
-    bm = dict(rank(question))
-    cosine = dense(question)
+    expanded = expand(question)
+    bm = dict(rank(expanded))
+    cosine = dense(expanded)
     cmax = float(cosine.max())
     bmax = max(max(bm.values()), 1e-9)
-    final = {i: 0.5 * bm[i] / bmax + 0.5 * float(cosine[i]) for i in range(len(PASSAGES))}
+    final = {i: 0.25 * bm[i] / bmax + 0.75 * float(cosine[i]) for i in range(len(PASSAGES))}
     order = sorted(final, key=lambda i: (-final[i], i))
     print(f"Q: {question} | cmax={cmax:.3f} | top={order[:3]}", flush=True)
 
