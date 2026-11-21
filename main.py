@@ -189,9 +189,10 @@ def query(req: Query) -> Result:
         return abstain
 
     if multi:
-        used = order[:2]
-        used.sort(key=lambda index: question_entity_position(question, index))
-        sources = used[:]
+        # Keep sources and scores in descending relevance order for the API contract.
+        sources = order[:2]
+        # Present synthesis evidence in the order the concepts appear in the question.
+        used = sorted(sources, key=lambda index: question_entity_position(question, index))
     else:
         used = order[:1]
         sources = order[:req.top_k]
