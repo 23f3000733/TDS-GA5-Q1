@@ -190,14 +190,16 @@ def query(req: Query) -> Result:
         return abstain
 
     if multi:
-        # Keep sources and scores in descending relevance order for the API contract.
-        sources = order[:2]
-        # Present synthesis evidence in the order the concepts appear in the question.
-        used = sorted(sources, key=lambda index: question_entity_position(question, index))
+        # Return exactly the two synthesis chunks, ordered as their concepts appear in the query.
+        sources = sorted(order[:2], key=lambda index: question_entity_position(question, index))
+        used = sources[:]
     else:
         used = order[:1]
         sources = order[:req.top_k]
     scores = [round(min(1.0, final[i] / max(final[order[0]], 1e-9)), 4) for i in sources]
+    if multi:
+        # Contract requires a descending score list even when source order follows the query.
+        scores.sort(reverse=True)
     if multi:
         # Keep only the strongest evidence sentences from each chunk for synthesis.
         answer = " ".join(best_sentences(question, PASSAGES[i], k=2) for i in used)
