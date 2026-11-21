@@ -36,6 +36,7 @@ INJ_EXTRA = re.compile(
 )
 MULTI_RE = re.compile(r"\b(both|integrate|synthes\w*|combine|compare|difference|contrast)\b", re.I)
 MECH_RE = re.compile(r"^\s*(how (does|do|is|are)\b|why\b)|formulation|formula|equation|derivation|proof", re.I)
+NUM_CUE = re.compile(r"\b(how many|how long|what (is|are) the|value|threshold|timeout|interval|port|size|quorum|limit|bits?)\b", re.I)
 
 def stem(t: str) -> str:
     return t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t
@@ -197,7 +198,11 @@ def query(req: Query) -> Result:
         used = order[:1]
         sources = order[:req.top_k]
     scores = [round(min(1.0, final[i] / max(final[order[0]], 1e-9)), 4) for i in sources]
-    answer = " ".join(PASSAGES[i] for i in used)
+    if multi:
+        # Keep only the strongest evidence sentences from each chunk for synthesis.
+        answer = " ".join(best_sentences(question, PASSAGES[i], k=2) for i in used)
+    else:
+        answer = PASSAGES[used[0]]
     print("A:", answer, "| src:", sources, flush=True)
     return Result(answer=answer, sources=sources, scores=scores,
                   confidence=round(min(0.99, max(0.62, cmax)), 4))
