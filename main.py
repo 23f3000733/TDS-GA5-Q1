@@ -83,6 +83,20 @@ def expand(question: str) -> str:
     extra = [value for key, value in SYN.items() if key in lower]
     return question + (" (" + " ".join(extra) + ")" if extra else "")
 
+PASSAGE_ENTITIES = {
+    0: ("raft",), 1: ("multi-paxos", "multi paxos", "paxos"),
+    10: ("sgd", "stochastic gradient descent"), 11: ("adamw",),
+    20: ("postgresql", "postgres", "postgre sql"), 21: ("mysql", "innodb"),
+    40: ("public key cryptography", "public-key cryptography", "rsa"),
+    41: ("elliptic curve cryptography", "elliptic-curve cryptography", "ecc", "ecdsa"),
+}
+
+def question_entity_position(question: str, passage_index: int) -> int:
+    """Find the earliest explicit mention of this passage's main concept."""
+    text = question.lower()
+    positions = [text.find(name) for name in PASSAGE_ENTITIES.get(passage_index, ()) if text.find(name) >= 0]
+    return min(positions, default=len(text) + passage_index)
+
 def rank(question: str) -> list[tuple[int, float]]:
     q = tokens(question)
     if not q:
@@ -176,6 +190,7 @@ def query(req: Query) -> Result:
 
     if multi:
         used = order[:2]
+        used.sort(key=lambda index: question_entity_position(question, index))
         sources = used[:]
     else:
         used = order[:1]
